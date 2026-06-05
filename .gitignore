@@ -1,0 +1,12 @@
+# 토큰/비밀 정보 — 절대 커밋 금지
+token.txt
+.env
+
+# 봇이 생성하는 캐시
+cache/
+
+# 파이썬
+__pycache__/
+*.pyc
+.venv/
+venv/
