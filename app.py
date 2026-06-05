@@ -48,7 +48,7 @@ MAX_IMAGE_PIXELS = 24_000_000
 # 임베드 폭 이상으로 키워서 꽉 차게 + 고해상도 디스플레이에서도 또렷하게
 DAY_IMAGE_TARGET_WIDTH = 800
 # 크롭/저장 방식이 바뀌면 올려서 기존 캐시를 자동 재생성
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -181,18 +181,31 @@ def crop_and_save_all_days(image_bytes, key):
                 right = left + int(column_width)
                 cropped = img.crop((left, top, right, bottom))
 
-                # 디스코드 임베드 폭에 맞춰 확대 후 샤프닝 (글씨 가독성)
+                # 디스코드 임베드 폭에 맞춰 확대 (글씨 가독성)
+                # 슈퍼샘플링: 목표의 2배로 확대 → 강하게 샤프닝 → 목표 크기로 축소
+                # 한 번에 확대+샤프닝하는 것보다 글씨 경계의 번짐/할로가 적음
                 if cropped.width < DAY_IMAGE_TARGET_WIDTH:
-                    scale = DAY_IMAGE_TARGET_WIDTH / cropped.width
-                    enlarged = cropped.resize(
-                        (DAY_IMAGE_TARGET_WIDTH, int(cropped.height * scale)),
+                    ss_width = DAY_IMAGE_TARGET_WIDTH * 2
+                    scale = ss_width / cropped.width
+                    big = cropped.resize(
+                        (ss_width, int(cropped.height * scale)),
                         Image.LANCZOS,
                     )
                     cropped.close()
-                    cropped = enlarged.filter(
-                        ImageFilter.UnsharpMask(radius=2, percent=110, threshold=2)
+                    sharpened = big.filter(
+                        ImageFilter.UnsharpMask(radius=4, percent=140, threshold=2)
                     )
-                    enlarged.close()
+                    big.close()
+                    final = sharpened.resize(
+                        (DAY_IMAGE_TARGET_WIDTH, sharpened.height // 2),
+                        Image.LANCZOS,
+                    )
+                    sharpened.close()
+                    # 축소 후 가벼운 마무리 샤프닝
+                    cropped = final.filter(
+                        ImageFilter.UnsharpMask(radius=1, percent=60, threshold=2)
+                    )
+                    final.close()
 
                 cropped.save(day_image_path(key, weekday), format='PNG')
                 cropped.close()
@@ -216,10 +229,14 @@ def extract_high_quality_image_url(raw_url):
     base_url = raw_url.split('?')[0]
 
     if 'postfiles.pstatic.net' in base_url or 'blogfiles.pstatic.net' in base_url:
+        # 네이버 CDN 은 ?type=wN 으로 "폭 N px 리사이즈" 변형을 제공 (원본보다 크면 원본 크기로 캡)
+        # 실측: w3840/w2000 → 원본 그대로, w966 → 966px 축소판,
+        #       type 없는 base URL 은 원본이 아니라 100px 썸네일을 반환함 → 최후 폴백으로만
         return [
-            base_url,
+            f"{base_url}?type=w3840",
+            f"{base_url}?type=w2000",
             f"{base_url}?type=w966",
-            f"{base_url}?type=w2",
+            base_url,
         ]
 
     return [base_url]
