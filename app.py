@@ -27,8 +27,9 @@ from zoneinfo import ZoneInfo
 import discord
 import requests
 from bs4 import BeautifulSoup
+from discord import app_commands
 from discord.ext import commands
-from PIL import Image
+from PIL import Image, ImageFilter
 
 # ==========================================
 # [설정]
@@ -39,7 +40,15 @@ TITLE_KEYWORD = '[메가스터디 구내식당]'
 GITHUB_URL = 'https://github.com/fdrn9999/mega-menu'
 KST = ZoneInfo("Asia/Seoul")
 REQUEST_TIMEOUT = 10          # 초
-MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024  # 이미지 다운로드 상한 12MB (메모리 보호)
+# 디스코드 무료 서버 업로드 한도(10MB)보다 약간 작게 — "캐시는 됐는데 전송만 실패"하는 사태 방지
+MAX_DOWNLOAD_BYTES = int(9.5 * 1024 * 1024)
+# 디코딩 후 비트맵 픽셀 상한 — 파일이 작아도 픽셀 수가 크면 RAM 폭탄 (2400만 px ≈ RGB 72MB)
+MAX_IMAGE_PIXELS = 24_000_000
+# 요일 크롭 확대 목표 폭 — 작은 이미지는 디스코드가 원본 크기 그대로 작게 표시하므로
+# 임베드 폭 이상으로 키워서 꽉 차게 + 고해상도 디스플레이에서도 또렷하게
+DAY_IMAGE_TARGET_WIDTH = 800
+# 크롭/저장 방식이 바뀌면 올려서 기존 캐시를 자동 재생성
+CACHE_VERSION = 2
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
@@ -145,12 +154,18 @@ def day_image_path(key, weekday):
 def crop_and_save_all_days(image_bytes, key):
     """
     원본 이미지를 한 번만 열어서 월~금 5개 컬럼을 크롭해 디스크에 저장.
+    크롭 원본은 폭이 좁아 디스코드에서 작게 표시되므로,
+    목표 폭까지 LANCZOS 확대 + 샤프닝해서 글씨가 잘 보이게 저장.
     저장 후 원본 비트맵은 즉시 해제 (128MB RAM 보호).
     """
     saved = 0
     img = Image.open(io.BytesIO(image_bytes))
     try:
         width, height = img.size
+
+        # 파일 크기와 무관하게 픽셀 수가 크면 디코딩 시 RAM 폭탄 → 디코딩 전에 차단
+        if width * height > MAX_IMAGE_PIXELS:
+            raise ValueError(f"이미지 픽셀 수 초과: {width}x{height}")
 
         # 크롭 좌표 기준 (식단표 레이아웃에 맞춰 튜닝한 값)
         top = int(height * 0.232)
@@ -165,6 +180,20 @@ def crop_and_save_all_days(image_bytes, key):
                 left = left_start + int(column_width * weekday)
                 right = left + int(column_width)
                 cropped = img.crop((left, top, right, bottom))
+
+                # 디스코드 임베드 폭에 맞춰 확대 후 샤프닝 (글씨 가독성)
+                if cropped.width < DAY_IMAGE_TARGET_WIDTH:
+                    scale = DAY_IMAGE_TARGET_WIDTH / cropped.width
+                    enlarged = cropped.resize(
+                        (DAY_IMAGE_TARGET_WIDTH, int(cropped.height * scale)),
+                        Image.LANCZOS,
+                    )
+                    cropped.close()
+                    cropped = enlarged.filter(
+                        ImageFilter.UnsharpMask(radius=2, percent=110, threshold=2)
+                    )
+                    enlarged.close()
+
                 cropped.save(day_image_path(key, weekday), format='PNG')
                 cropped.close()
                 saved += 1
@@ -331,8 +360,10 @@ def _download_best_image_sync(image_urls, post_url):
         if size > 0:
             candidates.append((size, url))
 
-    # 2) 가장 큰 것부터 시도
-    for _, url in sorted(candidates, reverse=True):
+    # 2) 가장 큰 것부터 시도 (다운로드/업로드 상한 초과 후보는 건너뜀)
+    for size, url in sorted(candidates, reverse=True):
+        if size > MAX_DOWNLOAD_BYTES:
+            continue
         content = _download_capped(url, img_headers)
         if content:
             return content, len(content), url
@@ -382,44 +413,51 @@ def _build_week_cache_sync(key, target_year, target_week, not_found_msg, valid_k
     if error_msg:
         return None, error_msg
 
-    image, size, final_url = _download_best_image_sync(data['image_urls'], data['post_url'])
-    if not image:
-        return None, f"모든 이미지 URL에서 다운로드 실패\n\n직접 확인: {data['post_url']}"
+    # 여기서 예외가 새어 나가면 유저는 "생각 중..."에서 영원히 멈춤 → 전부 잡아서 메시지로 변환
+    try:
+        image, size, final_url = _download_best_image_sync(data['image_urls'], data['post_url'])
+        if not image:
+            return None, f"모든 이미지 URL에서 다운로드 실패\n\n직접 확인: {data['post_url']}"
 
-    # 확장자 결정
-    ext = "jpg"
-    if final_url and "." in final_url:
-        ext = final_url.split(".")[-1].split("?")[0].lower()
-        if len(ext) > 4 or not ext.isalnum():
-            ext = "jpg"
+        # 확장자 결정
+        ext = "jpg"
+        if final_url and "." in final_url:
+            ext = final_url.split(".")[-1].split("?")[0].lower()
+            if len(ext) > 4 or not ext.isalnum():
+                ext = "jpg"
 
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    _cleanup_old_cache(valid_keys)
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        _cleanup_old_cache(valid_keys)
 
-    # 원본 저장 (전체 메뉴표용)
-    with open(full_image_path(key, ext), "wb") as f:
-        f.write(image)
+        # 원본 저장 (전체 메뉴표용)
+        with open(full_image_path(key, ext), "wb") as f:
+            f.write(image)
 
-    # 월~금 크롭 저장
-    saved = crop_and_save_all_days(image, key)
+        # 월~금 크롭 저장
+        saved = crop_and_save_all_days(image, key)
 
-    meta = {
-        **data,
-        "file_size": size,
-        "final_url": final_url,
-        "ext": ext,
-        "cropped_days": saved,
-    }
+        meta = {
+            **data,
+            "file_size": size,
+            "final_url": final_url,
+            "ext": ext,
+            "cropped_days": saved,
+            "cache_ver": CACHE_VERSION,
+        }
 
-    with open(meta_path(key), "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False)
+        with open(meta_path(key), "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False)
 
-    # 원본 바이트 즉시 해제
-    del image
-    gc.collect()
+        # 원본 바이트 즉시 해제
+        del image
+        gc.collect()
 
-    log.info("식단표 캐시 생성: %s (원본 %.1f KB, 크롭 %d개)", key, size / 1024, saved)
-    return meta, None
+        log.info("식단표 캐시 생성: %s (원본 %.1f KB, 크롭 %d개)", key, size / 1024, saved)
+        return meta, None
+
+    except Exception:
+        log.exception("캐시 생성 실패: %s", key)
+        return None, f"식단표 처리 중 오류가 발생했습니다.\n\n직접 확인: {data['post_url']}"
 
 
 def _load_meta_sync(key):
@@ -453,6 +491,8 @@ async def ensure_week_cache(target_year, target_week, not_found_msg):
             return key, _meta_memo[key], None
 
         meta = await asyncio.to_thread(_load_meta_sync, key)
+        if meta is not None and meta.get("cache_ver") != CACHE_VERSION:
+            meta = None  # 구버전 캐시 → 새 방식으로 재생성
         if meta is None:
             meta, error_msg = await asyncio.to_thread(
                 _build_week_cache_sync, key, target_year, target_week, not_found_msg, valid
@@ -498,7 +538,15 @@ async def send_full_sheet(interaction, key, meta, title):
     )
     embed.set_footer(text=f"이미지 크기: {meta['file_size'] / 1024:.1f} KB")
 
-    await interaction.followup.send(embed=embed, file=image_file)
+    try:
+        await interaction.followup.send(embed=embed, file=image_file)
+    except discord.HTTPException as e:
+        # 서버 업로드 한도 초과 등 — 이미지 없이 링크라도 안내
+        log.warning("전체 식단표 전송 실패 (%s): %s", key, e)
+        await interaction.followup.send(
+            f"⚠️ 이미지 전송에 실패했습니다. (파일이 서버 업로드 한도를 넘었을 수 있어요)\n\n"
+            f"직접 확인: {meta['post_url']}"
+        )
 
 
 # --------------------------------------------------------
@@ -626,9 +674,11 @@ async def suggest(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="디버그", description="[서버 오너 전용] 이미지 URL과 월~금 크롭 결과를 모두 확인합니다.")
+@app_commands.guild_only()
 async def debug(interaction: discord.Interaction):
 
-    if interaction.guild and interaction.user.id != interaction.guild.owner_id:
+    # DM 에서는 guild 가 None 이라 오너 체크가 통과돼 버림 → guild_only + 이중 확인
+    if not interaction.guild or interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("⛔ 이 명령어는 서버 오너만 사용 가능.", ephemeral=True)
         return
 
