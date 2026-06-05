@@ -2,14 +2,16 @@
 # 메가스터디 구내식당 메뉴 봇 (디스호스트 호스팅용)
 # 사양: RAM 128MB / CPU 25% / 디스크 512MB 환경에 최적화
 #
-# 코랩 버전과의 차이점:
-#  - nest_asyncio / Flask keep-alive 제거 (호스팅 환경에선 불필요)
-#  - 토큰을 환경변수(DISCORD_TOKEN) 또는 token.txt 에서 읽음 (코드에 직접 X)
-#  - 시간대를 Asia/Seoul 로 고정 (해외 서버에서도 한국 날짜/요일 기준으로 동작)
-#  - 무거운 작업(크롤링/다운로드/크롭)은 주차당 1번만 실행하고 결과를 디스크에 캐시
-#    → 명령어 호출 시에는 작은 PNG 파일만 읽어서 전송 (RAM/CPU 거의 안 씀)
-#  - 이미지 후보 3개를 전부 받지 않고 Content-Length 로 크기만 확인 후 1개만 다운로드
-#  - discord.py 메시지/멤버 캐시 비활성화로 상주 메모리 절약
+# 블로그 업로드 패턴: 매주 금요일에 "다음 주" 식단표가 올라옴
+#  → N주차 식단 = (N-1)주차 금요일 게시물
+#  → 게시일 + 3일의 ISO 주차로 매핑 (금/토/일 게시 모두 다음 주로 매핑됨)
+#
+# 명령어:
+#  /오점뭐   - 평일: 이번 주 식단표에서 오늘 요일 점심만 크롭해서 표시
+#  /이번주   - 이번 주(저번 금요일에 올라온) 식단표 전체 이미지
+#  /다음주   - 다음 주 식단표 전체 이미지 (금요일 업로드 후부터 조회 가능)
+#  /건의     - GitHub 저장소 링크 안내 (Issue/PR 로 건의)
+#  /디버그   - [서버 오너 전용] 크롤링 정보 + 월~금 크롭 결과 확인
 # ==========================================
 
 import asyncio
@@ -34,6 +36,7 @@ from PIL import Image
 BLOG_ID = 'megafs01'
 CATEGORY_NO = '41'
 TITLE_KEYWORD = '[메가스터디 구내식당]'
+GITHUB_URL = 'https://github.com/fdrn9999/mega-menu'
 KST = ZoneInfo("Asia/Seoul")
 REQUEST_TIMEOUT = 10          # 초
 MAX_DOWNLOAD_BYTES = 12 * 1024 * 1024  # 이미지 다운로드 상한 12MB (메모리 보호)
@@ -84,7 +87,6 @@ def load_token() -> str:
 
 
 # 권한 설정 — 슬래시 명령어만 쓰므로 기본 인텐트면 충분
-# (message_content 같은 특권 인텐트는 개발자 포털 설정도 필요해서 오히려 실행이 막힐 수 있음)
 intents = discord.Intents.default()
 
 
@@ -104,13 +106,24 @@ bot = MenuBot(
 
 
 # --------------------------------------------------------
-# 캐시 파일 경로 헬퍼
+# 주차 계산 / 캐시 파일 경로 헬퍼
 # --------------------------------------------------------
 
-def week_key(now: datetime.datetime) -> str:
+def make_key(iso_year, iso_week):
     """예: 2026-W23"""
-    iso_year, iso_week, _ = now.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
+
+
+def this_week_target(now):
+    """이번 주 (ISO 연도, 주차)"""
+    iso_year, iso_week, _ = now.isocalendar()
+    return iso_year, iso_week
+
+
+def next_week_target(now):
+    """다음 주 (ISO 연도, 주차) — 연말/연초 경계도 안전"""
+    iso_year, iso_week, _ = (now + datetime.timedelta(days=7)).isocalendar()
+    return iso_year, iso_week
 
 
 def meta_path(key):
@@ -139,7 +152,7 @@ def crop_and_save_all_days(image_bytes, key):
     try:
         width, height = img.size
 
-        # 크롭 좌표 기준 (사용자가 식단표 레이아웃에 맞춰 튜닝한 값 그대로 유지)
+        # 크롭 좌표 기준 (식단표 레이아웃에 맞춰 튜닝한 값)
         top = int(height * 0.232)
         crop_height = int(height * 0.25)
         bottom = top + crop_height
@@ -183,8 +196,12 @@ def extract_high_quality_image_url(raw_url):
     return [base_url]
 
 
-def _fetch_menu_sync():
-    """이번 주차 식단표 게시물을 찾아 메타데이터 + 이미지 URL 목록 반환"""
+def _fetch_menu_sync(target_year, target_week, not_found_msg):
+    """
+    target_year/target_week 주차에 해당하는 식단표 게시물을 찾아
+    메타데이터 + 이미지 URL 목록 반환.
+    (금요일에 올라온 글은 게시일+3일 보정으로 '다음 주' 식단으로 매핑됨)
+    """
     list_url = f"https://m.blog.naver.com/api/blogs/{BLOG_ID}/post-list?categoryNo={CATEGORY_NO}&itemCount=5"
     headers = {
         'User-Agent': 'Mozilla/5.0',
@@ -197,8 +214,6 @@ def _fetch_menu_sync():
         if not items:
             return None, "블로그 글 목록을 불러올 수 없습니다."
 
-        today = datetime.datetime.now(KST)
-        current_iso_year, current_iso_week, _ = today.isocalendar()
         target_post = None
         post_date = None
 
@@ -213,12 +228,12 @@ def _fetch_menu_sync():
             effective_date = post_date + datetime.timedelta(days=3)
             post_iso_year, post_iso_week, _ = effective_date.isocalendar()
 
-            if post_iso_year == current_iso_year and post_iso_week == current_iso_week:
+            if post_iso_year == target_year and post_iso_week == target_week:
                 target_post = post
                 break
 
         if not target_post:
-            return None, f"오늘({today.strftime('%Y-%m-%d')})에 해당하는 식단표가 블로그에 없습니다."
+            return None, not_found_msg
 
         log_no = target_post['logNo']
         post_view_url = f"https://blog.naver.com/PostView.naver?blogId={BLOG_ID}&logNo={log_no}"
@@ -260,7 +275,7 @@ def _fetch_menu_sync():
         return {
             "title": BeautifulSoup(target_post['titleWithInspectMessage'], "html.parser").get_text(),
             "date": post_date.strftime('%Y-%m-%d'),
-            "week_num": current_iso_week,
+            "week_num": target_week,
             "post_url": post_view_url,
             "image_urls": image_urls
         }, None
@@ -303,7 +318,6 @@ def _download_capped(url, headers):
 def _download_best_image_sync(image_urls, post_url):
     """
     후보 URL들의 크기를 헤더로만 비교한 뒤, 가장 큰(=고화질) 1개만 실제 다운로드.
-    (예전처럼 3개를 전부 받아 비교하지 않음 → 메모리/트래픽 절약)
     """
     img_headers = {
         'User-Agent': 'Mozilla/5.0',
@@ -335,28 +349,36 @@ def _download_best_image_sync(image_urls, post_url):
 # --------------------------------------------------------
 # 주차 단위 디스크 캐시
 #  - 무거운 작업은 주차당 1번, 이후엔 디스크의 작은 파일만 읽음
-#  - 새 주차 캐시를 만들 때 이전 주차 파일은 삭제 (디스크 512MB 보호)
+#  - 이번 주 + 다음 주 캐시만 유지, 지난 주차는 자동 삭제 (디스크 512MB 보호)
 # --------------------------------------------------------
 
 _cache_lock = asyncio.Lock()
-_meta_memo = {"key": None, "meta": None}  # 메타데이터(작은 dict)만 RAM에 유지
+_meta_memo = {}  # {주차키: 메타데이터 dict} — 작은 dict만 RAM에 유지
 
 
-def _cleanup_old_cache(current_key):
-    """현재 주차가 아닌 캐시 파일 전부 삭제"""
+def _valid_keys(now):
+    """지금 시점에 유지해야 할 캐시 주차키 (이번 주 + 다음 주)"""
+    return {
+        make_key(*this_week_target(now)),
+        make_key(*next_week_target(now)),
+    }
+
+
+def _cleanup_old_cache(valid_keys):
+    """유효 주차가 아닌 캐시 파일 전부 삭제"""
     if not os.path.isdir(CACHE_DIR):
         return
     for name in os.listdir(CACHE_DIR):
-        if name.startswith("menu_") and f"menu_{current_key}_" not in name:
+        if name.startswith("menu_") and not any(f"menu_{k}_" in name for k in valid_keys):
             try:
                 os.remove(os.path.join(CACHE_DIR, name))
             except OSError:
                 pass
 
 
-def _build_week_cache_sync(key):
+def _build_week_cache_sync(key, target_year, target_week, not_found_msg, valid_keys):
     """크롤링 → 다운로드 → 크롭 → 디스크 저장. 성공 시 메타데이터 dict 반환."""
-    data, error_msg = _fetch_menu_sync()
+    data, error_msg = _fetch_menu_sync(target_year, target_week, not_found_msg)
     if error_msg:
         return None, error_msg
 
@@ -372,9 +394,9 @@ def _build_week_cache_sync(key):
             ext = "jpg"
 
     os.makedirs(CACHE_DIR, exist_ok=True)
-    _cleanup_old_cache(key)
+    _cleanup_old_cache(valid_keys)
 
-    # 원본 저장 (주말용 전체 메뉴표)
+    # 원본 저장 (전체 메뉴표용)
     with open(full_image_path(key, ext), "wb") as f:
         f.write(image)
 
@@ -412,31 +434,71 @@ def _load_meta_sync(key):
         return None
 
 
-async def ensure_week_cache():
+async def ensure_week_cache(target_year, target_week, not_found_msg):
     """
-    이번 주차 캐시를 보장. (meta, error_msg) 반환.
+    해당 주차 캐시를 보장. (key, meta, error_msg) 반환.
     이미 캐시가 있으면 네트워크/CPU 작업 없이 즉시 반환.
     """
-    key = week_key(datetime.datetime.now(KST))
+    key = make_key(target_year, target_week)
+    now = datetime.datetime.now(KST)
+    valid = _valid_keys(now)
 
-    # RAM 메모(작은 dict)에 있으면 바로 반환
-    if _meta_memo["key"] == key and _meta_memo["meta"]:
-        return _meta_memo["meta"], None
+    # RAM 메모에 있으면 바로 반환
+    if key in _meta_memo:
+        return key, _meta_memo[key], None
 
     async with _cache_lock:
         # 락 대기 중 다른 요청이 만들었을 수 있으니 재확인
-        if _meta_memo["key"] == key and _meta_memo["meta"]:
-            return _meta_memo["meta"], None
+        if key in _meta_memo:
+            return key, _meta_memo[key], None
 
         meta = await asyncio.to_thread(_load_meta_sync, key)
         if meta is None:
-            meta, error_msg = await asyncio.to_thread(_build_week_cache_sync, key)
+            meta, error_msg = await asyncio.to_thread(
+                _build_week_cache_sync, key, target_year, target_week, not_found_msg, valid
+            )
             if error_msg:
-                return None, error_msg
+                return key, None, error_msg
 
-        _meta_memo["key"] = key
-        _meta_memo["meta"] = meta
-        return meta, None
+        # 지난 주차 메모 정리
+        for old in [k for k in _meta_memo if k not in valid]:
+            del _meta_memo[old]
+
+        _meta_memo[key] = meta
+        return key, meta, None
+
+
+# --------------------------------------------------------
+# 전체 식단표 전송 헬퍼 (/이번주, /다음주 공용)
+# --------------------------------------------------------
+
+async def send_full_sheet(interaction, key, meta, title):
+    path = full_image_path(key, meta['ext'])
+    if not os.path.exists(path):
+        await interaction.followup.send(
+            f"❌ 캐시된 이미지가 없습니다.\n\n직접 확인: {meta['post_url']}"
+        )
+        return
+
+    embed = discord.Embed(
+        title=title,
+        description=f"**{meta['week_num']}주차 식단표** (게시일: {meta['date']})",
+        color=0x3498db,
+        url=meta['post_url']
+    )
+
+    filename = f"weekly_menu_{meta['date']}.{meta['ext']}"
+    image_file = discord.File(path, filename=filename)
+
+    embed.set_image(url=f"attachment://{filename}")
+    embed.add_field(
+        name="📎 원본 링크",
+        value=f"[블로그에서 보기]({meta['post_url']})",
+        inline=False
+    )
+    embed.set_footer(text=f"이미지 크기: {meta['file_size'] / 1024:.1f} KB")
+
+    await interaction.followup.send(embed=embed, file=image_file)
 
 
 # --------------------------------------------------------
@@ -448,52 +510,32 @@ async def on_ready():
     log.info("✅ 로그인 성공: %s", bot.user)
 
 
-@bot.tree.command(name="메가스터디", description="오늘 날짜에 해당하는 점심 메뉴를 보여줍니다.")
-async def megastudy(interaction: discord.Interaction):
+@bot.tree.command(name="오점뭐", description="오늘 점심 메뉴를 보여줍니다. (평일 전용)")
+async def today_lunch(interaction: discord.Interaction):
+    now = datetime.datetime.now(KST)
+    weekday = now.weekday()  # 0=월 ~ 6=일
+
+    # 주말엔 오늘 점심이 없음
+    if weekday >= 5:
+        await interaction.response.send_message(
+            "🛌 주말에는 구내식당이 쉬어요.\n다음 주 메뉴는 `/다음주`, 이번 주 메뉴는 `/이번주` 로 확인하세요!"
+        )
+        return
+
     await interaction.response.defer()
 
-    meta, error_msg = await ensure_week_cache()
+    # 이번 주 식단 = 저번 주 금요일에 올라온 게시물 (금요일에 조회해도 여전히 이번 주 것)
+    target_year, target_week = this_week_target(now)
+    key, meta, error_msg = await ensure_week_cache(
+        target_year, target_week,
+        f"오늘({now.strftime('%Y-%m-%d')})에 해당하는 식단표가 블로그에 없습니다."
+    )
 
     if error_msg:
         await interaction.followup.send(f"⚠️ **{error_msg}**")
         return
 
     try:
-        key = week_key(datetime.datetime.now(KST))
-        today = datetime.datetime.now(KST)
-        weekday = today.weekday()  # 0=월 ~ 6=일
-
-        # 주말인 경우 (토, 일) — 전체 메뉴표 표시
-        if weekday >= 5:
-            path = full_image_path(key, meta['ext'])
-            if not os.path.exists(path):
-                await interaction.followup.send(
-                    f"❌ 캐시된 이미지가 없습니다.\n\n직접 확인: {meta['post_url']}"
-                )
-                return
-
-            embed = discord.Embed(
-                title="📅 다음 주 전체 메뉴표",
-                description=f"**{meta['week_num']}주차 식단표** (게시일: {meta['date']})\n주말이라 다음 주 전체 메뉴를 보여드립니다.",
-                color=0x3498db,
-                url=meta['post_url']
-            )
-
-            filename = f"weekly_menu_{meta['date']}.{meta['ext']}"
-            image_file = discord.File(path, filename=filename)
-
-            embed.set_image(url=f"attachment://{filename}")
-            embed.add_field(
-                name="📎 원본 링크",
-                value=f"[블로그에서 보기]({meta['post_url']})",
-                inline=False
-            )
-            embed.set_footer(text=f"이미지 크기: {meta['file_size'] / 1024:.1f} KB")
-
-            await interaction.followup.send(embed=embed, file=image_file)
-            return
-
-        # 평일인 경우 - 미리 크롭해둔 오늘 메뉴 파일 전송
         path = day_image_path(key, weekday)
         if not os.path.exists(path):
             await interaction.followup.send(
@@ -502,7 +544,7 @@ async def megastudy(interaction: discord.Interaction):
             return
 
         today_name = WEEKDAY_NAMES[weekday]
-        today_str = today.strftime('%Y-%m-%d')
+        today_str = now.strftime('%Y-%m-%d')
 
         embed = discord.Embed(
             title=f"🍚 오늘의 점심 메뉴 ({today_name})",
@@ -520,7 +562,7 @@ async def megastudy(interaction: discord.Interaction):
             value=f"[블로그에서 보기]({meta['post_url']})",
             inline=False
         )
-        embed.set_footer(text=f"{meta['week_num']}주차 식단표")
+        embed.set_footer(text=f"{meta['week_num']}주차 식단표 · 전체 메뉴는 /이번주")
 
         await interaction.followup.send(embed=embed, file=image_file)
 
@@ -529,6 +571,58 @@ async def megastudy(interaction: discord.Interaction):
         await interaction.followup.send(
             f"❌ 이미지 처리 실패: {e}\n\n직접 확인: {meta['post_url']}"
         )
+
+
+@bot.tree.command(name="이번주", description="이번 주 전체 식단표를 보여줍니다.")
+async def this_week(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    now = datetime.datetime.now(KST)
+    target_year, target_week = this_week_target(now)
+    key, meta, error_msg = await ensure_week_cache(
+        target_year, target_week,
+        "이번 주 식단표를 블로그에서 찾을 수 없습니다."
+    )
+
+    if error_msg:
+        await interaction.followup.send(f"⚠️ **{error_msg}**")
+        return
+
+    await send_full_sheet(interaction, key, meta, "📅 이번 주 전체 메뉴표")
+
+
+@bot.tree.command(name="다음주", description="다음 주 전체 식단표를 보여줍니다. (매주 금요일 업로드 후 조회 가능)")
+async def next_week(interaction: discord.Interaction):
+    await interaction.response.defer()
+
+    now = datetime.datetime.now(KST)
+    target_year, target_week = next_week_target(now)
+    key, meta, error_msg = await ensure_week_cache(
+        target_year, target_week,
+        "다음 주 식단표가 아직 올라오지 않았습니다.\n보통 **금요일 오전**에 블로그에 올라와요! 🕐"
+    )
+
+    if error_msg:
+        await interaction.followup.send(f"⚠️ **{error_msg}**")
+        return
+
+    await send_full_sheet(interaction, key, meta, "📅 다음 주 전체 메뉴표")
+
+
+@bot.tree.command(name="건의", description="봇에 대한 건의/버그 제보 방법을 알려줍니다.")
+async def suggest(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="💡 건의는 GitHub에서 받아요!",
+        description=(
+            "이 봇은 오픈소스로 관리됩니다.\n\n"
+            f"🐞 **버그 제보 / 아이디어** → [Issue 등록]({GITHUB_URL}/issues)\n"
+            f"🔧 **직접 코드 수정** → [Pull Request]({GITHUB_URL}/pulls)\n\n"
+            f"저장소: {GITHUB_URL}"
+        ),
+        color=0x7289da,
+        url=GITHUB_URL,
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="디버그", description="[서버 오너 전용] 이미지 URL과 월~금 크롭 결과를 모두 확인합니다.")
@@ -540,15 +634,18 @@ async def debug(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    meta, error_msg = await ensure_week_cache()
+    now = datetime.datetime.now(KST)
+    target_year, target_week = this_week_target(now)
+    key, meta, error_msg = await ensure_week_cache(
+        target_year, target_week,
+        "이번 주 식단표를 블로그에서 찾을 수 없습니다."
+    )
 
     if error_msg:
         await interaction.followup.send(f"⚠️ {error_msg}", ephemeral=True)
         return
 
-    key = week_key(datetime.datetime.now(KST))
-
-    debug_msg = f"""**디버그 정보**
+    debug_msg = f"""**디버그 정보** (이번 주: {key})
 - 게시물: {meta['title']}
 - 날짜: {meta['date']}
 - 블로그 링크: {meta['post_url']}
