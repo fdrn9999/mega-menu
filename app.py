@@ -7,11 +7,16 @@
 #  → 게시일 + 3일의 ISO 주차로 매핑 (금/토/일 게시 모두 다음 주로 매핑됨)
 #
 # 명령어:
-#  /오점뭐   - 평일: 이번 주 식단표에서 오늘 요일 점심만 크롭해서 표시
+#  /오점뭐   - 이번 주 식단표에서 오늘(또는 선택한 요일) 점심만 크롭해서 표시
 #  /이번주   - 이번 주(저번 금요일에 올라온) 식단표 전체 이미지
 #  /다음주   - 다음 주 식단표 전체 이미지 (금요일 업로드 후부터 조회 가능)
+#  /알림     - [서버 관리자 전용] 평일 지정 시각에 오늘 점심 자동 전송 (켜기/끄기/상태)
 #  /건의     - GitHub 저장소 링크 안내 (Issue/PR 로 건의)
 #  /디버그   - [서버 오너 전용] 크롤링 정보 + 월~금 크롭 결과 확인
+#
+# 자동 동작:
+#  - 1시간마다 이번 주(금~일엔 다음 주까지) 식단표를 미리 캐싱 → 첫 호출자도 즉시 응답
+#  - 크롤링 실패는 5분간 기억 → 글이 아직 없을 때 호출이 몰려도 블로그를 두드리지 않음
 # ==========================================
 
 import asyncio
@@ -22,13 +27,14 @@ import json
 import logging
 import os
 import sys
+import time
 from zoneinfo import ZoneInfo
 
 import discord
 import requests
 from bs4 import BeautifulSoup
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from PIL import Image, ImageFilter
 
 # ==========================================
@@ -49,11 +55,23 @@ MAX_IMAGE_PIXELS = 24_000_000
 DAY_IMAGE_TARGET_WIDTH = 800
 # 크롭/저장 방식이 바뀌면 올려서 기존 캐시를 자동 재생성
 CACHE_VERSION = 3
+# 자동 알림 기본 시각(KST)과 허용 범위(분) — 루프 지연/재시작으로 정각을 놓쳐도 범위 안이면 전송
+DEFAULT_NOTIFY_TIME = "11:30"
+NOTIFY_WINDOW_MIN = 10
+# 크롤링 실패 쿨다운(초) — 글이 아직 없을 때 호출 폭주로 블로그를 계속 두드리지 않게
+FAIL_COOLDOWN_SEC = 300
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(BASE_DIR, "cache")
+# 서버별 알림 설정 — git 에 없는 파일이라 디스호스트 자동 업데이트에도 유지됨 (.env 와 동일)
+NOTIFY_PATH = os.path.join(BASE_DIR, "notify.json")
 
 WEEKDAY_NAMES = ['월요일', '화요일', '수요일', '목요일', '금요일']
+
+MSG_THIS_WEEK_MISSING = "이번 주 식단표를 블로그에서 찾을 수 없습니다."
+MSG_NEXT_WEEK_MISSING = (
+    "다음 주 식단표가 아직 올라오지 않았습니다.\n보통 **금요일 오전**에 블로그에 올라와요! 🕐"
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mega-menu")
@@ -103,6 +121,7 @@ class MenuBot(commands.Bot):
     async def setup_hook(self):
         synced = await self.tree.sync()
         log.info("슬래시 명령어 %d개 동기화 완료", len(synced))
+        minute_tick.start()  # 점심 알림 + 프리페치 루프
 
 
 bot = MenuBot(
@@ -402,6 +421,7 @@ def _download_best_image_sync(image_urls, post_url):
 
 _cache_lock = asyncio.Lock()
 _meta_memo = {}  # {주차키: 메타데이터 dict} — 작은 dict만 RAM에 유지
+_fail_memo = {}  # {주차키: (monotonic 시각, 에러 메시지)} — 실패 직후 재크롤링 방지
 
 
 def _valid_keys(now):
@@ -507,6 +527,11 @@ async def ensure_week_cache(target_year, target_week, not_found_msg):
         if key in _meta_memo:
             return key, _meta_memo[key], None
 
+        # 방금 실패한 주차면 쿨다운 동안 같은 메시지로 즉시 응답 (블로그/CPU 보호)
+        failed = _fail_memo.get(key)
+        if failed and time.monotonic() - failed[0] < FAIL_COOLDOWN_SEC:
+            return key, None, failed[1]
+
         meta = await asyncio.to_thread(_load_meta_sync, key)
         if meta is not None and meta.get("cache_ver") != CACHE_VERSION:
             meta = None  # 구버전 캐시 → 새 방식으로 재생성
@@ -515,14 +540,92 @@ async def ensure_week_cache(target_year, target_week, not_found_msg):
                 _build_week_cache_sync, key, target_year, target_week, not_found_msg, valid
             )
             if error_msg:
+                _fail_memo[key] = (time.monotonic(), error_msg)
                 return key, None, error_msg
+            _fail_memo.pop(key, None)
 
         # 지난 주차 메모 정리
         for old in [k for k in _meta_memo if k not in valid]:
             del _meta_memo[old]
+        for old in [k for k in _fail_memo if k not in valid]:
+            del _fail_memo[old]
 
         _meta_memo[key] = meta
         return key, meta, None
+
+
+# --------------------------------------------------------
+# 서버별 점심 알림 설정 (notify.json)
+#  형식: {"길드ID": {"channel_id": int, "time": "HH:MM", "last_sent": "YYYY-MM-DD"}}
+# --------------------------------------------------------
+
+def _load_notify_conf():
+    if not os.path.exists(NOTIFY_PATH):
+        return {}
+    try:
+        with open(NOTIFY_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        log.warning("notify.json 읽기 실패 — 알림 설정을 비운 채 시작")
+        return {}
+
+
+def save_notify_conf():
+    """임시 파일에 쓰고 교체 — 쓰는 도중 봇이 죽어도 설정 파일이 깨지지 않음"""
+    tmp = NOTIFY_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(_notify_conf, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, NOTIFY_PATH)
+
+
+_notify_conf = _load_notify_conf()
+
+
+def parse_hhmm(text):
+    """'9:5' → '09:05', 잘못된 입력은 None"""
+    try:
+        hh, mm = text.strip().split(":")
+        hh, mm = int(hh), int(mm)
+        if 0 <= hh < 24 and 0 <= mm < 60:
+            return f"{hh:02d}:{mm:02d}"
+    except (ValueError, AttributeError):
+        pass
+    return None
+
+
+# --------------------------------------------------------
+# 요일 점심 임베드 헬퍼 (/오점뭐, 자동 알림 공용)
+# --------------------------------------------------------
+
+def build_day_embed(key, meta, weekday, day_date, is_today):
+    """요일 크롭 이미지 임베드 + 첨부 파일 생성. 크롭 파일이 없으면 (None, None)."""
+    path = day_image_path(key, weekday)
+    if not os.path.exists(path):
+        return None, None
+
+    day_name = WEEKDAY_NAMES[weekday]
+    date_str = day_date.strftime('%Y-%m-%d')
+    title = f"🍚 오늘의 점심 메뉴 ({day_name})" if is_today else f"🍚 {day_name} 점심 메뉴"
+
+    embed = discord.Embed(
+        title=title,
+        description=f"**{date_str}** 메가스터디 구내식당",
+        color=0x2ecc71,
+        url=meta['post_url']
+    )
+
+    filename = f"lunch_menu_{date_str}.png"
+    image_file = discord.File(path, filename=filename)
+
+    embed.set_image(url=f"attachment://{filename}")
+    embed.add_field(
+        name="📎 전체 메뉴 보기",
+        value=f"[블로그에서 보기]({meta['post_url']})",
+        inline=False
+    )
+    embed.set_footer(text=f"{meta['week_num']}주차 식단표 · 전체 메뉴는 /이번주")
+    return embed, image_file
 
 
 # --------------------------------------------------------
@@ -573,27 +676,38 @@ async def send_full_sheet(interaction, key, meta, title):
 @bot.event
 async def on_ready():
     log.info("✅ 로그인 성공: %s", bot.user)
+    await bot.change_presence(activity=discord.Game(name="/오점뭐 — 오늘 점심 확인"))
 
 
-@bot.tree.command(name="오점뭐", description="오늘 점심 메뉴를 보여줍니다. (평일 전용)")
-async def today_lunch(interaction: discord.Interaction):
+@bot.tree.command(name="오점뭐", description="오늘 점심 메뉴를 보여줍니다. (요일을 고르면 그 요일 점심)")
+@app_commands.describe(요일="다른 요일 점심이 궁금하면 선택 (기본: 오늘)")
+@app_commands.choices(요일=[
+    app_commands.Choice(name=name, value=i) for i, name in enumerate(WEEKDAY_NAMES)
+])
+async def today_lunch(interaction: discord.Interaction, 요일: app_commands.Choice[int] | None = None):
     now = datetime.datetime.now(KST)
-    weekday = now.weekday()  # 0=월 ~ 6=일
 
-    # 주말엔 오늘 점심이 없음
-    if weekday >= 5:
-        await interaction.response.send_message(
-            "🛌 주말에는 구내식당이 쉬어요.\n다음 주 메뉴는 `/다음주`, 이번 주 메뉴는 `/이번주` 로 확인하세요!"
-        )
-        return
+    if 요일 is not None:
+        weekday = 요일.value
+    else:
+        weekday = now.weekday()  # 0=월 ~ 6=일
+        # 주말엔 오늘 점심이 없음 (요일을 고르면 이번 주 식단표에서 그 요일을 보여줌)
+        if weekday >= 5:
+            await interaction.response.send_message(
+                "🛌 주말에는 구내식당이 쉬어요.\n"
+                "다음 주 메뉴는 `/다음주`, 이번 주 메뉴는 `/이번주`,\n"
+                "이번 주 특정 요일 점심은 `/오점뭐 요일:` 로 확인하세요!"
+            )
+            return
 
     await interaction.response.defer()
 
     # 이번 주 식단 = 저번 주 금요일에 올라온 게시물 (금요일에 조회해도 여전히 이번 주 것)
     target_year, target_week = this_week_target(now)
+    day_date = now + datetime.timedelta(days=weekday - now.weekday())
     key, meta, error_msg = await ensure_week_cache(
         target_year, target_week,
-        f"오늘({now.strftime('%Y-%m-%d')})에 해당하는 식단표가 블로그에 없습니다."
+        f"{day_date.strftime('%Y-%m-%d')}에 해당하는 식단표가 블로그에 없습니다."
     )
 
     if error_msg:
@@ -601,33 +715,14 @@ async def today_lunch(interaction: discord.Interaction):
         return
 
     try:
-        path = day_image_path(key, weekday)
-        if not os.path.exists(path):
+        embed, image_file = build_day_embed(
+            key, meta, weekday, day_date, is_today=(weekday == now.weekday())
+        )
+        if embed is None:
             await interaction.followup.send(
                 f"❌ 이미지 크롭 실패\n\n직접 확인: {meta['post_url']}"
             )
             return
-
-        today_name = WEEKDAY_NAMES[weekday]
-        today_str = now.strftime('%Y-%m-%d')
-
-        embed = discord.Embed(
-            title=f"🍚 오늘의 점심 메뉴 ({today_name})",
-            description=f"**{today_str}** 메가스터디 구내식당",
-            color=0x2ecc71,
-            url=meta['post_url']
-        )
-
-        filename = f"lunch_menu_{today_str}.png"
-        image_file = discord.File(path, filename=filename)
-
-        embed.set_image(url=f"attachment://{filename}")
-        embed.add_field(
-            name="📎 전체 메뉴 보기",
-            value=f"[블로그에서 보기]({meta['post_url']})",
-            inline=False
-        )
-        embed.set_footer(text=f"{meta['week_num']}주차 식단표 · 전체 메뉴는 /이번주")
 
         await interaction.followup.send(embed=embed, file=image_file)
 
@@ -645,8 +740,7 @@ async def this_week(interaction: discord.Interaction):
     now = datetime.datetime.now(KST)
     target_year, target_week = this_week_target(now)
     key, meta, error_msg = await ensure_week_cache(
-        target_year, target_week,
-        "이번 주 식단표를 블로그에서 찾을 수 없습니다."
+        target_year, target_week, MSG_THIS_WEEK_MISSING
     )
 
     if error_msg:
@@ -663,8 +757,7 @@ async def next_week(interaction: discord.Interaction):
     now = datetime.datetime.now(KST)
     target_year, target_week = next_week_target(now)
     key, meta, error_msg = await ensure_week_cache(
-        target_year, target_week,
-        "다음 주 식단표가 아직 올라오지 않았습니다.\n보통 **금요일 오전**에 블로그에 올라와요! 🕐"
+        target_year, target_week, MSG_NEXT_WEEK_MISSING
     )
 
     if error_msg:
@@ -690,6 +783,104 @@ async def suggest(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# --------------------------------------------------------
+# /알림 — 평일 점심 자동 알림 (서버 관리자 전용)
+# --------------------------------------------------------
+
+notify_group = app_commands.Group(
+    name="알림",
+    description="평일 점심 자동 알림 설정 (서버 관리자 전용)",
+    guild_only=True,
+    default_permissions=discord.Permissions(manage_guild=True),
+)
+
+
+async def _check_manager(interaction):
+    """서버 관리 권한 확인 — 없으면 안내 메시지까지 보내고 False 반환"""
+    if not interaction.guild or not interaction.user.guild_permissions.manage_guild:
+        await interaction.response.send_message(
+            "⛔ **서버 관리** 권한이 있어야 사용할 수 있어요.", ephemeral=True
+        )
+        return False
+    return True
+
+
+@notify_group.command(name="켜기", description="평일 지정 시각에 오늘 점심 메뉴를 자동으로 올립니다.")
+@app_commands.describe(
+    채널="알림을 보낼 채널 (기본: 지금 이 채널)",
+    시간=f"알림 시각, 24시간제 HH:MM (기본: {DEFAULT_NOTIFY_TIME})",
+)
+async def notify_on(
+    interaction: discord.Interaction,
+    채널: discord.TextChannel | None = None,
+    시간: str = DEFAULT_NOTIFY_TIME,
+):
+    if not await _check_manager(interaction):
+        return
+
+    hhmm = parse_hhmm(시간)
+    if hhmm is None:
+        await interaction.response.send_message(
+            f"⚠️ 시간은 24시간제 `HH:MM` 형식으로 입력해주세요. (예: `{DEFAULT_NOTIFY_TIME}`)",
+            ephemeral=True,
+        )
+        return
+
+    channel = 채널 or interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        await interaction.response.send_message(
+            "⚠️ 일반 텍스트 채널만 알림 채널로 쓸 수 있어요.", ephemeral=True
+        )
+        return
+
+    perms = channel.permissions_for(interaction.guild.me)
+    if not (perms.send_messages and perms.embed_links and perms.attach_files):
+        await interaction.response.send_message(
+            f"⚠️ {channel.mention} 채널에 봇 권한이 부족해요.\n"
+            "필요 권한: **메시지 보내기, 링크 첨부(임베드), 파일 첨부**",
+            ephemeral=True,
+        )
+        return
+
+    _notify_conf[str(interaction.guild_id)] = {"channel_id": channel.id, "time": hhmm}
+    save_notify_conf()
+    await interaction.response.send_message(
+        f"✅ 평일 **{hhmm}** 에 {channel.mention} 채널로 오늘 점심 메뉴를 보내드릴게요!",
+        ephemeral=True,
+    )
+
+
+@notify_group.command(name="끄기", description="이 서버의 점심 자동 알림을 끕니다.")
+async def notify_off(interaction: discord.Interaction):
+    if not await _check_manager(interaction):
+        return
+
+    if _notify_conf.pop(str(interaction.guild_id), None) is None:
+        await interaction.response.send_message("이 서버에는 켜져 있는 알림이 없어요.", ephemeral=True)
+        return
+
+    save_notify_conf()
+    await interaction.response.send_message("🔕 점심 자동 알림을 껐어요.", ephemeral=True)
+
+
+@notify_group.command(name="상태", description="이 서버의 점심 알림 설정을 확인합니다.")
+async def notify_status(interaction: discord.Interaction):
+    conf = _notify_conf.get(str(interaction.guild_id))
+    if not conf:
+        await interaction.response.send_message(
+            "이 서버에는 알림이 꺼져 있어요. `/알림 켜기` 로 시작!", ephemeral=True
+        )
+        return
+
+    msg = f"🔔 평일 **{conf.get('time', DEFAULT_NOTIFY_TIME)}** 에 <#{conf['channel_id']}> 채널로 알림 중"
+    if conf.get("last_sent"):
+        msg += f"\n마지막 전송: {conf['last_sent']}"
+    await interaction.response.send_message(msg, ephemeral=True)
+
+
+bot.tree.add_command(notify_group)
+
+
 @bot.tree.command(name="디버그", description="[서버 오너 전용] 이미지 URL과 월~금 크롭 결과를 모두 확인합니다.")
 @app_commands.guild_only()
 async def debug(interaction: discord.Interaction):
@@ -704,8 +895,7 @@ async def debug(interaction: discord.Interaction):
     now = datetime.datetime.now(KST)
     target_year, target_week = this_week_target(now)
     key, meta, error_msg = await ensure_week_cache(
-        target_year, target_week,
-        "이번 주 식단표를 블로그에서 찾을 수 없습니다."
+        target_year, target_week, MSG_THIS_WEEK_MISSING
     )
 
     if error_msg:
@@ -752,6 +942,104 @@ async def debug(interaction: discord.Interaction):
     except Exception as e:
         log.exception("디버그 크롭 실패")
         await interaction.followup.send(f"❌ 크롭 처리 실패: {e}", ephemeral=True)
+
+
+# --------------------------------------------------------
+# 백그라운드 루프 — 평일 점심 알림 + 식단표 프리페치
+# --------------------------------------------------------
+
+_last_prefetch_hour = None  # (날짜, 시) — 프리페치는 시간당 1번만 시도
+
+
+async def _send_lunch_notification(guild_id, conf):
+    """설정된 채널로 오늘 점심 크롭 이미지를 전송"""
+    channel = bot.get_channel(conf["channel_id"])
+    if channel is None:
+        log.warning("알림 채널을 찾을 수 없음 (guild %s, channel %s)", guild_id, conf["channel_id"])
+        return
+
+    now = datetime.datetime.now(KST)
+    weekday = now.weekday()
+    target_year, target_week = this_week_target(now)
+    key, meta, error_msg = await ensure_week_cache(target_year, target_week, MSG_THIS_WEEK_MISSING)
+
+    if error_msg:
+        await channel.send(f"🔔 오늘의 점심 알림\n⚠️ **{error_msg}**")
+        return
+
+    embed, image_file = build_day_embed(key, meta, weekday, now, is_today=True)
+    if embed is None:
+        await channel.send(f"🔔 오늘의 점심 알림\n❌ 이미지 크롭 실패\n\n직접 확인: {meta['post_url']}")
+        return
+
+    await channel.send(content="🔔 오늘의 점심 알림", embed=embed, file=image_file)
+
+
+async def _prefetch_caches(now):
+    """식단표를 미리 캐싱해 첫 호출자도 기다리지 않게 (캐시가 있으면 아무것도 안 함)"""
+    target_year, target_week = this_week_target(now)
+    _, _, err = await ensure_week_cache(target_year, target_week, MSG_THIS_WEEK_MISSING)
+    if err:
+        log.info("프리페치(이번 주) 실패: %s", err.replace("\n", " "))
+
+    # 금~일: 금요일에 올라오는 다음 주 식단표도 미리 캐싱
+    if now.weekday() >= 4:
+        target_year, target_week = next_week_target(now)
+        _, _, err = await ensure_week_cache(target_year, target_week, MSG_NEXT_WEEK_MISSING)
+        if err:
+            log.debug("프리페치(다음 주) 실패: %s", err.replace("\n", " "))
+
+
+@tasks.loop(minutes=1)
+async def minute_tick():
+    global _last_prefetch_hour
+    try:
+        now = datetime.datetime.now(KST)
+
+        # ① 평일 점심 알림 — 루프 지연/재시작으로 정각을 놓쳐도 허용 범위 안이면 전송
+        if now.weekday() < 5 and _notify_conf:
+            today = now.date().isoformat()
+            now_min = now.hour * 60 + now.minute
+            changed = False
+            for guild_id, conf in list(_notify_conf.items()):
+                try:
+                    hh, mm = conf.get("time", DEFAULT_NOTIFY_TIME).split(":")
+                    target_min = int(hh) * 60 + int(mm)
+                except ValueError:
+                    continue
+                if not (0 <= now_min - target_min < NOTIFY_WINDOW_MIN):
+                    continue
+                if conf.get("last_sent") == today:
+                    continue
+                conf["last_sent"] = today  # 전송 시도 전에 기록 — 실패해도 같은 날 도배 방지
+                changed = True
+                try:
+                    await _send_lunch_notification(guild_id, conf)
+                except Exception:
+                    log.exception("점심 알림 전송 실패 (guild %s)", guild_id)
+            if changed:
+                save_notify_conf()
+
+        # ② 시간당 1번: 식단표 프리페치
+        hour_key = (now.date(), now.hour)
+        if hour_key != _last_prefetch_hour:
+            _last_prefetch_hour = hour_key
+            await _prefetch_caches(now)
+
+    except Exception:
+        log.exception("백그라운드 루프 오류")
+
+
+@minute_tick.before_loop
+async def _wait_until_ready():
+    await bot.wait_until_ready()
+
+
+@bot.event
+async def on_guild_remove(guild):
+    """봇이 서버에서 제거되면 해당 서버의 알림 설정도 정리"""
+    if _notify_conf.pop(str(guild.id), None) is not None:
+        save_notify_conf()
 
 
 # ==========================================

@@ -5,6 +5,9 @@ token.txt
 # 봇이 생성하는 캐시
 cache/
 
+# 서버별 점심 알림 설정 (봇이 생성 — 자동 업데이트에도 유지돼야 함)
+notify.json
+
 # 파이썬
 __pycache__/
 *.pyc
