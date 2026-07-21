@@ -2,9 +2,9 @@
 # 메가스터디 구내식당 메뉴 봇 (디스호스트 호스팅용)
 # 사양: RAM 128MB / CPU 25% / 디스크 512MB 환경에 최적화
 #
-# 블로그 업로드 패턴: 매주 금요일에 "다음 주" 식단표가 올라옴
-#  → N주차 식단 = (N-1)주차 금요일 게시물
-#  → 게시일 + 3일의 ISO 주차로 매핑 (금/토/일 게시 모두 다음 주로 매핑됨)
+# 블로그 업로드 패턴: 보통 금요일에 "다음 주" 식단표가 올라옴 (가끔 목요일에 하루 일찍)
+#  → 제목의 날짜 범위 시작일(예: "2026.07.20~07.24" → 07.20)의 ISO 주차로 매핑
+#  → 업로드 요일(목/금/토)에 흔들리지 않음. 제목에 날짜가 없으면 게시일+3일로 폴백
 #
 # 명령어:
 #  /오점뭐   - 이번 주 식단표에서 오늘(또는 선택한 요일) 점심만 크롭해서 표시
@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 from zoneinfo import ZoneInfo
@@ -261,6 +262,31 @@ def extract_high_quality_image_url(raw_url):
     return [base_url]
 
 
+def _post_target_week(clean_title, post_date):
+    """
+    이 게시물이 '몇 주차 식단표'인지 (ISO 연도, 주차)로 반환.
+
+    제목의 날짜 범위 시작일(예: '2026.07.20~07.24' → 07.20)을 최우선으로 사용한다.
+    이렇게 하면 업로드 요일에 흔들리지 않는다:
+      - 예전엔 게시일+3일로만 매핑 → '금요일 업로드' 가정에 묶여 있었음
+      - 목요일에 하루 일찍 올라오면 목+3=일요일이라 아직 같은 주 → 다음 주로 못 넘어가
+        해당 주차 조회가 통째로 실패했음 (제목엔 올바른 주가 적혀 있는데도)
+    제목에서 날짜를 못 읽을 때만 기존 게시일+3일 방식으로 폴백.
+    """
+    m = re.search(r'(\d{4})\.\s*(\d{1,2})\.\s*(\d{1,2})', clean_title)
+    if m:
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            iso_year, iso_week, _ = datetime.date(y, mo, d).isocalendar()
+            return iso_year, iso_week
+        except ValueError:
+            pass  # 제목의 날짜가 비정상 → 폴백
+
+    effective_date = post_date + datetime.timedelta(days=3)
+    iso_year, iso_week, _ = effective_date.isocalendar()
+    return iso_year, iso_week
+
+
 def _fetch_menu_sync(target_year, target_week, not_found_msg):
     """
     target_year/target_week 주차에 해당하는 식단표 게시물을 찾아
@@ -290,8 +316,7 @@ def _fetch_menu_sync(target_year, target_week, not_found_msg):
                 continue
 
             post_date = datetime.datetime.fromtimestamp(post['addDate'] / 1000, KST)
-            effective_date = post_date + datetime.timedelta(days=3)
-            post_iso_year, post_iso_week, _ = effective_date.isocalendar()
+            post_iso_year, post_iso_week = _post_target_week(clean_title, post_date)
 
             if post_iso_year == target_year and post_iso_week == target_week:
                 target_post = post
