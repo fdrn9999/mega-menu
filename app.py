@@ -8,15 +8,17 @@
 #
 # 명령어:
 #  /오점뭐   - 이번 주 식단표에서 오늘(또는 선택한 요일) 점심만 크롭해서 표시
+#              주말엔 다음 주 식단표(올라와 있으면)에서 월요일/선택 요일을 미리 보여줌
 #  /이번주   - 이번 주(저번 금요일에 올라온) 식단표 전체 이미지
 #  /다음주   - 다음 주 식단표 전체 이미지 (금요일 업로드 후부터 조회 가능)
-#  /알림     - [서버 관리자 전용] 평일 지정 시각에 오늘 점심 자동 전송 (켜기/끄기/상태)
+#  /알림     - [서버 관리자 전용] 평일 지정 시각에 오늘 점심 자동 전송 (켜기/끄기/상태/휴무)
 #  /건의     - GitHub 저장소 링크 안내 (Issue/PR 로 건의)
-#  /디버그   - [서버 오너 전용] 크롤링 정보 + 월~금 크롭 결과 확인
+#  /디버그   - [서버 오너 전용] 크롤링 정보 + 월~금 크롭 결과 확인 (이번 주/다음 주)
 #
 # 자동 동작:
-#  - 1시간마다 이번 주(금~일엔 다음 주까지) 식단표를 미리 캐싱 → 첫 호출자도 즉시 응답
+#  - 1시간마다 이번 주(목~일엔 다음 주까지) 식단표를 미리 캐싱 → 첫 호출자도 즉시 응답
 #  - 크롤링 실패는 5분간 기억 → 글이 아직 없을 때 호출이 몰려도 블로그를 두드리지 않음
+#  - 공휴일(내장 목록 + /알림 휴무 로 등록한 날)엔 점심 알림을 보내지 않음
 # ==========================================
 
 import asyncio
@@ -73,6 +75,43 @@ MSG_THIS_WEEK_MISSING = "이번 주 식단표를 블로그에서 찾을 수 없�
 MSG_NEXT_WEEK_MISSING = (
     "다음 주 식단표가 아직 올라오지 않았습니다.\n보통 **금요일 오전**에 블로그에 올라와요! 🕐"
 )
+
+# 구내식당 휴무일(공휴일) — 이 날엔 점심 알림을 보내지 않음
+# 매년 같은 날짜인 공휴일 (월, 일). 주말과 겹쳐도 알림은 평일에만 돌므로 대체공휴일만 따로 관리
+FIXED_HOLIDAYS = {
+    (1, 1),    # 신정
+    (3, 1),    # 삼일절
+    (5, 5),    # 어린이날
+    (6, 6),    # 현충일
+    (8, 15),   # 광복절
+    (10, 3),   # 개천절
+    (10, 9),   # 한글날
+    (12, 25),  # 성탄절
+    # 제헌절(7/17)은 공휴일 재지정이 확정되면 추가
+}
+# 음력 기반 공휴일 + 대체공휴일 (해마다 바뀌므로 연 단위로 갱신 — 빠진 날은 /알림 휴무 로 등록)
+LUNAR_AND_SUBSTITUTE_HOLIDAYS = {
+    # 2026
+    "2026-02-16", "2026-02-17", "2026-02-18",  # 설날 연휴
+    "2026-03-02",                              # 삼일절 대체공휴일 (3/1 일요일)
+    "2026-05-24", "2026-05-25",                # 부처님오신날 + 대체공휴일 (5/24 일요일)
+    "2026-06-03",                              # 지방선거
+    "2026-08-17",                              # 광복절 대체공휴일 (8/15 토요일)
+    "2026-09-24", "2026-09-25", "2026-09-26",  # 추석 연휴 (토요일 겹침은 대체공휴일 없음 — 일요일 겹침만 대체)
+    "2026-10-05",                              # 개천절 대체공휴일 (10/3 토요일)
+    # 2027 이후는 연말에 추가 (그 전까지는 /알림 휴무 로 서버별 등록)
+}
+
+
+def is_holiday(d, extra=()):
+    """공휴일 여부: 고정 공휴일 + 음력/대체공휴일 목록 + 서버별 수동 등록 날짜"""
+    iso = d.isoformat()
+    return (
+        (d.month, d.day) in FIXED_HOLIDAYS
+        or iso in LUNAR_AND_SUBSTITUTE_HOLIDAYS
+        or iso in extra
+    )
+
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("mega-menu")
@@ -153,6 +192,11 @@ def next_week_target(now):
     """다음 주 (ISO 연도, 주차) — 연말/연초 경계도 안전"""
     iso_year, iso_week, _ = (now + datetime.timedelta(days=7)).isocalendar()
     return iso_year, iso_week
+
+
+def week_monday(iso_year, iso_week):
+    """해당 ISO 주차의 월요일 날짜(date)"""
+    return datetime.date.fromisocalendar(iso_year, iso_week, 1)
 
 
 def meta_path(key):
@@ -287,11 +331,16 @@ def _post_target_week(clean_title, post_date):
     return iso_year, iso_week
 
 
-def _fetch_menu_sync(target_year, target_week, not_found_msg):
+# "그 주차 게시물이 아직 없음" 을 뜻하는 에러 표식 — 호출자마다 다른 안내 문구를 붙일 수 있게 문구 대신 표식으로 돌려줌
+NOT_FOUND = "__not_found__"
+
+
+def _fetch_menu_sync(target_year, target_week):
     """
     target_year/target_week 주차에 해당하는 식단표 게시물을 찾아
-    메타데이터 + 이미지 URL 목록 반환.
-    (금요일에 올라온 글은 게시일+3일 보정으로 '다음 주' 식단으로 매핑됨)
+    메타데이터 + 이미지 URL 목록 반환. (data, error) 형태이며
+    해당 주차 글이 없으면 error 로 NOT_FOUND 표식을 돌려준다.
+    주차 판정은 _post_target_week (제목의 날짜 범위 우선) 기준.
     """
     list_url = f"https://m.blog.naver.com/api/blogs/{BLOG_ID}/post-list?categoryNo={CATEGORY_NO}&itemCount=5"
     headers = {
@@ -323,7 +372,7 @@ def _fetch_menu_sync(target_year, target_week, not_found_msg):
                 break
 
         if not target_post:
-            return None, not_found_msg
+            return None, NOT_FOUND
 
         log_no = target_post['logNo']
         post_view_url = f"https://blog.naver.com/PostView.naver?blogId={BLOG_ID}&logNo={log_no}"
@@ -387,7 +436,7 @@ def _probe_size(url, headers):
 
 
 def _download_capped(url, headers):
-    """상한(12MB)을 넘으면 중단하는 안전한 다운로드"""
+    """상한(MAX_DOWNLOAD_BYTES, 9.5MB)을 넘으면 중단하는 안전한 다운로드"""
     try:
         with requests.get(url, headers=headers, stream=True, timeout=REQUEST_TIMEOUT) as r:
             if r.status_code != 200:
@@ -469,9 +518,12 @@ def _cleanup_old_cache(valid_keys):
                 pass
 
 
-def _build_week_cache_sync(key, target_year, target_week, not_found_msg, valid_keys):
-    """크롤링 → 다운로드 → 크롭 → 디스크 저장. 성공 시 메타데이터 dict 반환."""
-    data, error_msg = _fetch_menu_sync(target_year, target_week, not_found_msg)
+def _build_week_cache_sync(key, target_year, target_week, valid_keys):
+    """
+    크롤링 → 다운로드 → 크롭 → 디스크 저장. (meta, error) 반환.
+    error 는 NOT_FOUND 표식이거나 사용자에게 보여줄 오류 문구.
+    """
+    data, error_msg = _fetch_menu_sync(target_year, target_week)
     if error_msg:
         return None, error_msg
 
@@ -522,22 +574,52 @@ def _build_week_cache_sync(key, target_year, target_week, not_found_msg, valid_k
         return None, f"식단표 처리 중 오류가 발생했습니다.\n\n직접 확인: {data['post_url']}"
 
 
+def invalidate_week_cache(key):
+    """
+    RAM 메모에서 해당 주차를 지워 다음 호출 때 디스크 검증(_load_meta_sync)부터 다시 타게 한다.
+    캐시 생성 후 이미지 파일이 사라진 경우(수동 삭제 등)에 호출 — 그렇지 않으면 메모가 살아 있는 동안
+    그 주 내내 '이미지 없음' 만 뜬다.
+    """
+    if _meta_memo.pop(key, None) is not None:
+        log.warning("캐시 파일 누락 → RAM 메모 무효화: %s", key)
+
+
 def _load_meta_sync(key):
-    """디스크에서 메타데이터 읽기 (없으면 None)"""
+    """
+    디스크에서 메타데이터 읽기. 없거나, 구버전이거나, 메타가 가리키는 이미지 파일이
+    실제로 없으면(디스크 정리/쓰기 중단 등) None 을 돌려줘 재생성되게 한다.
+    → 예전엔 메타만 믿어서 파일이 사라지면 그 주 내내 '크롭 실패'만 떴음.
+    """
     path = meta_path(key)
     if not os.path.exists(path):
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            meta = json.load(f)
     except Exception:
         return None
+
+    if meta.get("cache_ver") != CACHE_VERSION:
+        return None  # 구버전 캐시 → 새 방식으로 재생성
+
+    if not os.path.exists(full_image_path(key, meta.get("ext", "jpg"))):
+        log.warning("캐시 메타는 있는데 원본 이미지가 없음 → 재생성: %s", key)
+        return None
+    day_files = sum(os.path.exists(day_image_path(key, wd)) for wd in range(5))
+    if day_files != meta.get("cropped_days", 5):
+        log.warning("캐시 요일 이미지 수 불일치(%d≠%s) → 재생성: %s", day_files, meta.get("cropped_days"), key)
+        return None
+    return meta
 
 
 async def ensure_week_cache(target_year, target_week, not_found_msg):
     """
-    해당 주차 캐시를 보장. (key, meta, error_msg) 반환.
+    해당 주차 캐시를 보장. (key, meta, error_msg, not_found) 반환.
+      - 성공: (key, meta, None, False)
+      - 그 주차 글이 아직 없음: (key, None, not_found_msg, True)
+      - 네트워크/처리 오류 등 일시 실패: (key, None, 오류문구, False)
     이미 캐시가 있으면 네트워크/CPU 작업 없이 즉시 반환.
+    실패 쿨다운은 '글 없음' 여부만 기억하므로, 쿨다운 중에도 호출자별 안내 문구가 유지된다.
     """
     key = make_key(target_year, target_week)
     now = datetime.datetime.now(KST)
@@ -545,28 +627,28 @@ async def ensure_week_cache(target_year, target_week, not_found_msg):
 
     # RAM 메모에 있으면 바로 반환
     if key in _meta_memo:
-        return key, _meta_memo[key], None
+        return key, _meta_memo[key], None, False
 
     async with _cache_lock:
         # 락 대기 중 다른 요청이 만들었을 수 있으니 재확인
         if key in _meta_memo:
-            return key, _meta_memo[key], None
+            return key, _meta_memo[key], None, False
 
-        # 방금 실패한 주차면 쿨다운 동안 같은 메시지로 즉시 응답 (블로그/CPU 보호)
+        # 방금 실패한 주차면 쿨다운 동안 재크롤링 없이 즉시 응답 (블로그/CPU 보호)
         failed = _fail_memo.get(key)
         if failed and time.monotonic() - failed[0] < FAIL_COOLDOWN_SEC:
-            return key, None, failed[1]
+            _, error_msg, not_found = failed
+            return key, None, (not_found_msg if not_found else error_msg), not_found
 
         meta = await asyncio.to_thread(_load_meta_sync, key)
-        if meta is not None and meta.get("cache_ver") != CACHE_VERSION:
-            meta = None  # 구버전 캐시 → 새 방식으로 재생성
         if meta is None:
             meta, error_msg = await asyncio.to_thread(
-                _build_week_cache_sync, key, target_year, target_week, not_found_msg, valid
+                _build_week_cache_sync, key, target_year, target_week, valid
             )
             if error_msg:
-                _fail_memo[key] = (time.monotonic(), error_msg)
-                return key, None, error_msg
+                not_found = error_msg == NOT_FOUND
+                _fail_memo[key] = (time.monotonic(), error_msg, not_found)
+                return key, None, (not_found_msg if not_found else error_msg), not_found
             _fail_memo.pop(key, None)
 
         # 지난 주차 메모 정리
@@ -576,12 +658,13 @@ async def ensure_week_cache(target_year, target_week, not_found_msg):
             del _fail_memo[old]
 
         _meta_memo[key] = meta
-        return key, meta, None
+        return key, meta, None, False
 
 
 # --------------------------------------------------------
 # 서버별 점심 알림 설정 (notify.json)
-#  형식: {"길드ID": {"channel_id": int, "time": "HH:MM", "last_sent": "YYYY-MM-DD"}}
+#  형식: {"길드ID": {"channel_id": int, "time": "HH:MM", "last_sent": "YYYY-MM-DD",
+#                    "role_id": int(선택), "skip_dates": ["YYYY-MM-DD", ...](선택)}}
 # --------------------------------------------------------
 
 def _load_notify_conf():
@@ -623,7 +706,7 @@ def parse_hhmm(text):
 # 요일 점심 임베드 헬퍼 (/오점뭐, 자동 알림 공용)
 # --------------------------------------------------------
 
-def build_day_embed(key, meta, weekday, day_date, is_today):
+def build_day_embed(key, meta, weekday, day_date, is_today, is_next_week=False):
     """요일 크롭 이미지 임베드 + 첨부 파일 생성. 크롭 파일이 없으면 (None, None)."""
     path = day_image_path(key, weekday)
     if not os.path.exists(path):
@@ -631,7 +714,12 @@ def build_day_embed(key, meta, weekday, day_date, is_today):
 
     day_name = WEEKDAY_NAMES[weekday]
     date_str = day_date.strftime('%Y-%m-%d')
-    title = f"🍚 오늘의 점심 메뉴 ({day_name})" if is_today else f"🍚 {day_name} 점심 메뉴"
+    if is_today:
+        title = f"🍚 오늘의 점심 메뉴 ({day_name})"
+    elif is_next_week:
+        title = f"🍚 다음 주 {day_name} 점심 메뉴 (미리보기)"
+    else:
+        title = f"🍚 {day_name} 점심 메뉴"
 
     embed = discord.Embed(
         title=title,
@@ -649,7 +737,8 @@ def build_day_embed(key, meta, weekday, day_date, is_today):
         value=f"[블로그에서 보기]({meta['post_url']})",
         inline=False
     )
-    embed.set_footer(text=f"{meta['week_num']}주차 식단표 · 전체 메뉴는 /이번주")
+    full_cmd = "/다음주" if is_next_week else "/이번주"
+    embed.set_footer(text=f"{meta['week_num']}주차 식단표 · 전체 메뉴는 {full_cmd}")
     return embed, image_file
 
 
@@ -660,6 +749,7 @@ def build_day_embed(key, meta, weekday, day_date, is_today):
 async def send_full_sheet(interaction, key, meta, title):
     path = full_image_path(key, meta['ext'])
     if not os.path.exists(path):
+        invalidate_week_cache(key)
         await interaction.followup.send(
             f"❌ 캐시된 이미지가 없습니다.\n\n직접 확인: {meta['post_url']}"
         )
@@ -711,39 +801,63 @@ async def on_ready():
 ])
 async def today_lunch(interaction: discord.Interaction, 요일: app_commands.Choice[int] | None = None):
     now = datetime.datetime.now(KST)
-
-    if 요일 is not None:
-        weekday = 요일.value
-    else:
-        weekday = now.weekday()  # 0=월 ~ 6=일
-        # 주말엔 오늘 점심이 없음 (요일을 고르면 이번 주 식단표에서 그 요일을 보여줌)
-        if weekday >= 5:
-            await interaction.response.send_message(
-                "🛌 주말에는 구내식당이 쉬어요.\n"
-                "다음 주 메뉴는 `/다음주`, 이번 주 메뉴는 `/이번주`,\n"
-                "이번 주 특정 요일 점심은 `/오점뭐 요일:` 로 확인하세요!"
-            )
-            return
+    today = now.date()
+    is_weekend = now.weekday() >= 5
+    weekday = 요일.value if 요일 is not None else now.weekday()  # 0=월 ~ 6=일
 
     await interaction.response.defer()
 
-    # 이번 주 식단 = 저번 주 금요일에 올라온 게시물 (금요일에 조회해도 여전히 이번 주 것)
-    target_year, target_week = this_week_target(now)
-    day_date = now + datetime.timedelta(days=weekday - now.weekday())
-    key, meta, error_msg = await ensure_week_cache(
-        target_year, target_week,
-        f"{day_date.strftime('%Y-%m-%d')}에 해당하는 식단표가 블로그에 없습니다."
-    )
+    # 평일: 이번 주 식단 (저번 주 금요일에 올라온 게시물 — 금요일에 조회해도 여전히 이번 주 것)
+    # 주말: '이번 주'는 이미 지나간 주라 지난 메뉴가 나옴 → 다음 주 식단표를 먼저 찾고,
+    #       아직 안 올라왔으면 이번 주 것으로 폴백 (요일을 고른 경우에만)
+    is_next_week = False
+    if is_weekend:
+        target_year, target_week = next_week_target(now)
+        key, meta, error_msg, not_found = await ensure_week_cache(
+            target_year, target_week, MSG_NEXT_WEEK_MISSING
+        )
+        if error_msg is None:
+            is_next_week = True
+            if 요일 is None:
+                weekday = 0  # 주말 기본: 다음 주 월요일 미리보기
+        elif 요일 is None:
+            # 다음 주 식단표가 아직 없음 → 쉬는 날 안내
+            if not_found:
+                reason = "다음 주 식단표는 아직 안 올라왔어요. (보통 **금요일 오전**에 올라와요)"
+            else:
+                reason = f"⚠️ {error_msg}"
+            await interaction.followup.send(
+                "🛌 주말에는 구내식당이 쉬어요.\n"
+                f"{reason}\n"
+                "이번 주 메뉴는 `/이번주`, 이번 주 특정 요일 점심은 `/오점뭐 요일:` 로 확인하세요!"
+            )
+            return
+        else:
+            target_year, target_week = this_week_target(now)
+            key, meta, error_msg, not_found = await ensure_week_cache(
+                target_year, target_week, MSG_THIS_WEEK_MISSING
+            )
+    else:
+        target_year, target_week = this_week_target(now)
+        day_date_hint = week_monday(target_year, target_week) + datetime.timedelta(days=weekday)
+        key, meta, error_msg, not_found = await ensure_week_cache(
+            target_year, target_week,
+            f"{day_date_hint.isoformat()}에 해당하는 식단표가 블로그에 없습니다."
+        )
 
     if error_msg:
         await interaction.followup.send(f"⚠️ **{error_msg}**")
         return
 
+    day_date = week_monday(target_year, target_week) + datetime.timedelta(days=weekday)
+
     try:
         embed, image_file = build_day_embed(
-            key, meta, weekday, day_date, is_today=(weekday == now.weekday())
+            key, meta, weekday, day_date,
+            is_today=(day_date == today), is_next_week=is_next_week,
         )
         if embed is None:
+            invalidate_week_cache(key)
             await interaction.followup.send(
                 f"❌ 이미지 크롭 실패\n\n직접 확인: {meta['post_url']}"
             )
@@ -764,7 +878,7 @@ async def this_week(interaction: discord.Interaction):
 
     now = datetime.datetime.now(KST)
     target_year, target_week = this_week_target(now)
-    key, meta, error_msg = await ensure_week_cache(
+    key, meta, error_msg, _ = await ensure_week_cache(
         target_year, target_week, MSG_THIS_WEEK_MISSING
     )
 
@@ -772,7 +886,10 @@ async def this_week(interaction: discord.Interaction):
         await interaction.followup.send(f"⚠️ **{error_msg}**")
         return
 
-    await send_full_sheet(interaction, key, meta, "📅 이번 주 전체 메뉴표")
+    title = "📅 이번 주 전체 메뉴표"
+    if now.weekday() >= 5:
+        title += " (지나간 주 · 다음 주는 /다음주)"
+    await send_full_sheet(interaction, key, meta, title)
 
 
 @bot.tree.command(name="다음주", description="다음 주 전체 식단표를 보여줍니다. (매주 금요일 업로드 후 조회 가능)")
@@ -781,7 +898,7 @@ async def next_week(interaction: discord.Interaction):
 
     now = datetime.datetime.now(KST)
     target_year, target_week = next_week_target(now)
-    key, meta, error_msg = await ensure_week_cache(
+    key, meta, error_msg, _ = await ensure_week_cache(
         target_year, target_week, MSG_NEXT_WEEK_MISSING
     )
 
@@ -834,11 +951,13 @@ async def _check_manager(interaction):
 @app_commands.describe(
     채널="알림을 보낼 채널 (기본: 지금 이 채널)",
     시간=f"알림 시각, 24시간제 HH:MM (기본: {DEFAULT_NOTIFY_TIME})",
+    멘션="알림 때 함께 호출할 역할 (선택)",
 )
 async def notify_on(
     interaction: discord.Interaction,
     채널: discord.TextChannel | None = None,
     시간: str = DEFAULT_NOTIFY_TIME,
+    멘션: discord.Role | None = None,
 ):
     if not await _check_manager(interaction):
         return
@@ -867,12 +986,77 @@ async def notify_on(
         )
         return
 
-    _notify_conf[str(interaction.guild_id)] = {"channel_id": channel.id, "time": hhmm}
+    # 역할 멘션: '모두 멘션' 이 꺼진 역할(또는 @everyone)은 봇에 '모든 역할 멘션' 권한이 있어야 실제로 울림
+    if 멘션 is not None and not 멘션.mentionable and not perms.mention_everyone:
+        await interaction.response.send_message(
+            f"⚠️ {멘션.mention} 역할은 '모두가 이 역할을 멘션할 수 있음' 이 꺼져 있어서\n"
+            f"봇에 {channel.mention} 채널의 **@everyone, @here, 모든 역할 멘션** 권한이 있어야 호출돼요.",
+            ephemeral=True,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        return
+
+    prev = _notify_conf.get(str(interaction.guild_id), {})
+    conf = {"channel_id": channel.id, "time": hhmm}
+    if 멘션 is not None:
+        conf["role_id"] = 멘션.id
+    if prev.get("skip_dates"):
+        conf["skip_dates"] = prev["skip_dates"]  # 등록해 둔 휴무일은 유지
+    _notify_conf[str(interaction.guild_id)] = conf
     save_notify_conf()
+
+    msg = f"✅ 평일 **{hhmm}** 에 {channel.mention} 채널로 오늘 점심 메뉴를 보내드릴게요!"
+    if 멘션 is not None:
+        msg += f"\n📣 알림마다 {멘션.mention} 역할을 함께 호출해요."
+    msg += "\n🏖️ 공휴일에는 보내지 않아요. 휴무일 추가 등록은 `/알림 휴무`"
     await interaction.response.send_message(
-        f"✅ 평일 **{hhmm}** 에 {channel.mention} 채널로 오늘 점심 메뉴를 보내드릴게요!",
-        ephemeral=True,
+        msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
     )
+
+
+@notify_group.command(name="휴무", description="식당 휴무일을 등록/해제합니다. (그날은 알림을 보내지 않음)")
+@app_commands.describe(날짜="YYYY-MM-DD 형식 (이미 등록된 날짜면 해제)")
+async def notify_skip(interaction: discord.Interaction, 날짜: str):
+    if not await _check_manager(interaction):
+        return
+
+    try:
+        d = datetime.date.fromisoformat(날짜.strip())
+    except ValueError:
+        await interaction.response.send_message(
+            "⚠️ 날짜는 `YYYY-MM-DD` 형식으로 입력해주세요. (예: `2026-12-31`)", ephemeral=True
+        )
+        return
+
+    conf = _notify_conf.get(str(interaction.guild_id))
+    if not conf:
+        await interaction.response.send_message(
+            "이 서버에는 알림이 꺼져 있어요. 먼저 `/알림 켜기` 로 켜주세요.", ephemeral=True
+        )
+        return
+
+    iso = d.isoformat()
+    skip = conf.setdefault("skip_dates", [])
+    if iso in skip:
+        skip.remove(iso)
+        msg = f"✅ **{iso}** 휴무 등록을 해제했어요."
+    elif is_holiday(d):
+        await interaction.response.send_message(
+            f"**{iso}** 은 이미 공휴일로 등록돼 있어서 알림이 가지 않아요.", ephemeral=True
+        )
+        return
+    else:
+        skip.append(iso)
+        skip.sort()
+        msg = f"✅ **{iso}** 을 휴무일로 등록했어요. 그날은 알림을 보내지 않아요."
+
+    # 지난 날짜는 정리 (목록이 무한히 커지지 않게)
+    today_iso = datetime.datetime.now(KST).date().isoformat()
+    conf["skip_dates"] = [s for s in skip if s >= today_iso]
+    if not conf["skip_dates"]:
+        del conf["skip_dates"]
+    save_notify_conf()
+    await interaction.response.send_message(msg, ephemeral=True)
 
 
 @notify_group.command(name="끄기", description="이 서버의 점심 자동 알림을 끕니다.")
@@ -898,9 +1082,16 @@ async def notify_status(interaction: discord.Interaction):
         return
 
     msg = f"🔔 평일 **{conf.get('time', DEFAULT_NOTIFY_TIME)}** 에 <#{conf['channel_id']}> 채널로 알림 중"
+    if conf.get("role_id"):
+        msg += f"\n📣 함께 호출: <@&{conf['role_id']}>"
+    if conf.get("skip_dates"):
+        msg += "\n🏖️ 등록된 휴무일: " + ", ".join(conf["skip_dates"])
+    msg += "\n(공휴일은 자동으로 건너뜁니다)"
     if conf.get("last_sent"):
         msg += f"\n마지막 전송: {conf['last_sent']}"
-    await interaction.response.send_message(msg, ephemeral=True)
+    await interaction.response.send_message(
+        msg, ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 bot.tree.add_command(notify_group)
@@ -908,7 +1099,12 @@ bot.tree.add_command(notify_group)
 
 @bot.tree.command(name="디버그", description="[서버 오너 전용] 이미지 URL과 월~금 크롭 결과를 모두 확인합니다.")
 @app_commands.guild_only()
-async def debug(interaction: discord.Interaction):
+@app_commands.describe(주차="확인할 주차 (기본: 이번 주)")
+@app_commands.choices(주차=[
+    app_commands.Choice(name="이번 주", value="this"),
+    app_commands.Choice(name="다음 주", value="next"),
+])
+async def debug(interaction: discord.Interaction, 주차: app_commands.Choice[str] | None = None):
 
     # DM 에서는 guild 가 None 이라 오너 체크가 통과돼 버림 → guild_only + 이중 확인
     if not interaction.guild or interaction.user.id != interaction.guild.owner_id:
@@ -918,16 +1114,21 @@ async def debug(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     now = datetime.datetime.now(KST)
-    target_year, target_week = this_week_target(now)
-    key, meta, error_msg = await ensure_week_cache(
-        target_year, target_week, MSG_THIS_WEEK_MISSING
-    )
+    if 주차 is not None and 주차.value == "next":
+        label = "다음 주"
+        target_year, target_week = next_week_target(now)
+        missing_msg = MSG_NEXT_WEEK_MISSING
+    else:
+        label = "이번 주"
+        target_year, target_week = this_week_target(now)
+        missing_msg = MSG_THIS_WEEK_MISSING
+    key, meta, error_msg, _ = await ensure_week_cache(target_year, target_week, missing_msg)
 
     if error_msg:
         await interaction.followup.send(f"⚠️ {error_msg}", ephemeral=True)
         return
 
-    debug_msg = f"""**디버그 정보** (이번 주: {key})
+    debug_msg = f"""**디버그 정보** ({label}: {key})
 - 게시물: {meta['title']}
 - 날짜: {meta['date']}
 - 블로그 링크: {meta['post_url']}
@@ -976,41 +1177,74 @@ async def debug(interaction: discord.Interaction):
 _last_prefetch_hour = None  # (날짜, 시) — 프리페치는 시간당 1번만 시도
 
 
-async def _send_lunch_notification(guild_id, conf):
-    """설정된 채널로 오늘 점심 크롭 이미지를 전송"""
+def _minute_of_day(dt):
+    return dt.hour * 60 + dt.minute
+
+
+async def _send_lunch_notification(guild_id, conf, window_end_min):
+    """
+    설정된 채널로 오늘 점심 크롭 이미지를 전송.
+    반환값: True = 오늘 처리 끝(전송했거나 더 시도해도 소용없음), False = 일시 오류라 잠시 후 재시도.
+      - 식단표 자체가 없음(NOT_FOUND): 그날은 한 번만 안내하고 끝
+      - 네트워크/처리 오류: 알림 허용 시간(NOTIFY_WINDOW_MIN) 안에서 재시도, 마지막 시도에만 채널에 안내
+      - 채널에 보낼 권한이 없음(Forbidden): 그 서버 알림을 자동으로 끔 (매일 조용히 실패하던 것 방지)
+    window_end_min: 알림 허용 창이 끝나는 분(하루 기준). 크롤링이 오래 걸려 창을 넘겼는지는
+    시도가 끝난 뒤의 시각으로 다시 판단한다 (루프 시작 시각만 보면 마지막 안내를 영영 못 보낼 수 있음).
+    """
     channel = bot.get_channel(conf["channel_id"])
     if channel is None:
         log.warning("알림 채널을 찾을 수 없음 (guild %s, channel %s)", guild_id, conf["channel_id"])
-        return
+        return True
 
     now = datetime.datetime.now(KST)
     weekday = now.weekday()
     target_year, target_week = this_week_target(now)
-    key, meta, error_msg = await ensure_week_cache(target_year, target_week, MSG_THIS_WEEK_MISSING)
+    key, meta, error_msg, not_found = await ensure_week_cache(
+        target_year, target_week, MSG_THIS_WEEK_MISSING
+    )
 
-    if error_msg:
-        await channel.send(f"🔔 오늘의 점심 알림\n⚠️ **{error_msg}**")
-        return
+    try:
+        if error_msg:
+            # 창의 마지막 1분에 들어섰으면(시도 후 시각 기준) 더는 미루지 않고 안내 후 마감
+            final_attempt = _minute_of_day(datetime.datetime.now(KST)) >= window_end_min - 1
+            if not not_found and not final_attempt:
+                log.info("점심 알림 일시 오류 → 재시도 예정 (guild %s): %s", guild_id, error_msg.replace("\n", " "))
+                return False
+            await channel.send(f"🔔 오늘의 점심 알림\n⚠️ **{error_msg}**")
+            return True
 
-    embed, image_file = build_day_embed(key, meta, weekday, now, is_today=True)
-    if embed is None:
-        await channel.send(f"🔔 오늘의 점심 알림\n❌ 이미지 크롭 실패\n\n직접 확인: {meta['post_url']}")
-        return
+        embed, image_file = build_day_embed(key, meta, weekday, now, is_today=True)
+        if embed is None:
+            invalidate_week_cache(key)
+            await channel.send(f"🔔 오늘의 점심 알림\n❌ 이미지 크롭 실패\n\n직접 확인: {meta['post_url']}")
+            return True
 
-    await channel.send(content="🔔 오늘의 점심 알림", embed=embed, file=image_file)
+        content = "🔔 오늘의 점심 알림"
+        if conf.get("role_id"):
+            content += f" <@&{conf['role_id']}>"
+        await channel.send(
+            content=content, embed=embed, file=image_file,
+            allowed_mentions=discord.AllowedMentions(roles=True, everyone=True),
+        )
+        return True
+
+    except discord.Forbidden:
+        log.warning("알림 채널 권한 없음 → 알림 자동 해제 (guild %s, channel %s)", guild_id, conf["channel_id"])
+        _notify_conf.pop(guild_id, None)
+        return True
 
 
 async def _prefetch_caches(now):
     """식단표를 미리 캐싱해 첫 호출자도 기다리지 않게 (캐시가 있으면 아무것도 안 함)"""
     target_year, target_week = this_week_target(now)
-    _, _, err = await ensure_week_cache(target_year, target_week, MSG_THIS_WEEK_MISSING)
+    _, _, err, _ = await ensure_week_cache(target_year, target_week, MSG_THIS_WEEK_MISSING)
     if err:
         log.info("프리페치(이번 주) 실패: %s", err.replace("\n", " "))
 
-    # 금~일: 금요일에 올라오는 다음 주 식단표도 미리 캐싱
-    if now.weekday() >= 4:
+    # 목~일: 금요일(가끔 목요일)에 올라오는 다음 주 식단표도 미리 캐싱
+    if now.weekday() >= 3:
         target_year, target_week = next_week_target(now)
-        _, _, err = await ensure_week_cache(target_year, target_week, MSG_NEXT_WEEK_MISSING)
+        _, _, err, _ = await ensure_week_cache(target_year, target_week, MSG_NEXT_WEEK_MISSING)
         if err:
             log.debug("프리페치(다음 주) 실패: %s", err.replace("\n", " "))
 
@@ -1032,16 +1266,26 @@ async def minute_tick():
                     target_min = int(hh) * 60 + int(mm)
                 except ValueError:
                     continue
-                if not (0 <= now_min - target_min < NOTIFY_WINDOW_MIN):
+                elapsed = now_min - target_min
+                if not (0 <= elapsed < NOTIFY_WINDOW_MIN):
                     continue
                 if conf.get("last_sent") == today:
                     continue
-                conf["last_sent"] = today  # 전송 시도 전에 기록 — 실패해도 같은 날 도배 방지
-                changed = True
+                if is_holiday(now.date(), conf.get("skip_dates", ())):
+                    conf["last_sent"] = today  # 휴무일 — 보내지 않고 오늘은 처리된 것으로 기록
+                    changed = True
+                    log.info("휴무일이라 점심 알림 건너뜀 (guild %s, %s)", guild_id, today)
+                    continue
+                window_end_min = target_min + NOTIFY_WINDOW_MIN
                 try:
-                    await _send_lunch_notification(guild_id, conf)
+                    done = await _send_lunch_notification(guild_id, conf, window_end_min)
                 except Exception:
                     log.exception("점심 알림 전송 실패 (guild %s)", guild_id)
+                    # 예외도 창의 마지막 1분(시도 후 시각 기준)이면 포기하고 마감
+                    done = _minute_of_day(datetime.datetime.now(KST)) >= window_end_min - 1
+                if done:
+                    conf["last_sent"] = today  # 전송(또는 포기) 후 기록 — 같은 날 도배 방지
+                    changed = True
             if changed:
                 save_notify_conf()
 
